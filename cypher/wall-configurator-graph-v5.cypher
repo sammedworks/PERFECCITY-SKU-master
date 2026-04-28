@@ -296,8 +296,10 @@ MATCH (s:Subcategory {name:'WPC_CLASSIC'}),(m:InstallationMethod {name:'CLIP_ADH
 MATCH (s:Subcategory {name:'WPC_NEW'}),    (m:InstallationMethod {name:'CLIP_ADHESIVE'})   MERGE (s)-[:USES_METHOD]->(m);
 MATCH (s:Subcategory {name:'WPC_CERAMIC'}),(m:InstallationMethod {name:'CLIP_ADHESIVE'})   MERGE (s)-[:USES_METHOD]->(m);
 MATCH (s:Subcategory {name:'CHARCOAL'}),   (m:InstallationMethod {name:'SILICON_GLUE'})    MERGE (s)-[:USES_METHOD]->(m);
-MATCH (p:Panel) WHERE p.sku IN ['SHT-UV-MARBLE','SHT-SPC'],                                      (m:InstallationMethod {name:'SILICON_GLUE'})   MERGE (p)-[:USES_METHOD]->(m);
-MATCH (p:Panel) WHERE p.sku IN ['SHT-METALLIC','SHT-WPC-5MM','SHT-WPC-GROOVED-7MM'],            (m:InstallationMethod {name:'ADHESIVE_ONLY'})  MERGE (p)-[:USES_METHOD]->(m);
+MATCH (p:Panel) WHERE p.sku IN ['SHT-UV-MARBLE','SHT-SPC']
+MATCH (m:InstallationMethod {name:'SILICON_GLUE'})   MERGE (p)-[:USES_METHOD]->(m);
+MATCH (p:Panel) WHERE p.sku IN ['SHT-METALLIC','SHT-WPC-5MM','SHT-WPC-GROOVED-7MM']
+MATCH (m:InstallationMethod {name:'ADHESIVE_ONLY'})  MERGE (p)-[:USES_METHOD]->(m);
 
 
 // ─────────────────────────────────────────────────────────────────────────────
