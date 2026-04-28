@@ -2,10 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Copy everything first so hatchling can discover the package
 COPY pyproject.toml .
-RUN pip install --no-cache-dir .
-
 COPY app/ app/
+
+RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
