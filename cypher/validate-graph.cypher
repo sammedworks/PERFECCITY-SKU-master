@@ -57,11 +57,12 @@ RETURN subcat, defaults AS default_count;
 
 
 // ── V8. Installation method coverage — every panel subcategory has a method ──
-// Expected: EMPTY (all 7 panel subcategories should have USES_METHOD)
+// Expected: EMPTY (all 7 panel subcategories should have USES_METHOD —
+//           either at the subcategory level or via individual panels)
 MATCH (s:Subcategory)
 WHERE s.name IN ['PVC_PANEL','PVC_FLUTE','WPC_CLASSIC','WPC_NEW','WPC_CERAMIC','CHARCOAL','SHEET']
 AND NOT (s)-[:USES_METHOD]->(:InstallationMethod)
-AND NOT ()-[:USES_METHOD]->(:InstallationMethod) // Some panels have direct USES_METHOD
+AND NOT EXISTS { MATCH (p:Panel)-[:BELONGS_TO]->(s) WHERE (p)-[:USES_METHOD]->(:InstallationMethod) }
 RETURN s.name AS missing_install_method;
 
 
