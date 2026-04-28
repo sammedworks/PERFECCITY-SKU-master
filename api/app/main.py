@@ -1,0 +1,470 @@
+"""Perfeccity Wall Configurator API — FastAPI application."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.db import close_driver, get_session, init_driver
+from app.models import (
+    BOMConsumable,
+    BOMPanelEntry,
+    BOMResult,
+    BOMTrim,
+    CartCreateIn,
+    CartItemIn,
+    CartItemOut,
+    CartOut,
+    ConsumableOut,
+    DefaultPanelOut,
+    EvaluateResult,
+    FurnitureOut,
+    LEDProfileOut,
+    PanelOut,
+    TrimOut,
+    ValidationResult,
+    Violation,
+)
+from app.queries import (
+    ADD_CART_ITEM,
+    ALL_CONSUMABLES,
+    ALL_FURNITURE,
+    ALL_LED_PROFILES,
+    ALL_TRIMS,
+    BOM_CONSUMABLES,
+    BOM_TRIMS,
+    CREATE_CART,
+    DEFAULT_PANEL_FOR_ROOM,
+    DELETE_CART,
+    GET_CART,
+    LED_STRIPS_AND_KITS,
+    PANEL_ACCESSORIES,
+    PANELS_BY_SUBCATEGORY,
+    REMOVE_CART_ITEM,
+    ROOM_RANKED_PANELS,
+    VALIDATE_CART,
+)
+
+# ── App lifecycle ────────────────────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await init_driver()
+    yield
+    await close_driver()
+
+
+app = FastAPI(
+    title=settings.app_title,
+    version=settings.app_version,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _node_props(record, key: str = "p") -> dict:
+    node = record[key]
+    return dict(node)
+
+
+def _safe_int(val) -> int | None:
+    if val is None:
+        return None
+    return int(val)
+
+
+def _safe_list(val) -> list:
+    if val is None:
+        return []
+    return list(val)
+
+
+# ── Health ───────────────────────────────────────────────────────────────────
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": settings.app_version}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CATALOG ENDPOINTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/catalog/panels", response_model=list[PanelOut])
+async def list_panels(
+    subcategory: str | None = Query(None, description="Filter by subcategory"),
+    availability: str | None = Query(None, description="Filter by availability"),
+):
+    async with get_session() as session:
+        result = await session.run(
+            PANELS_BY_SUBCATEGORY,
+            subcategory=subcategory,
+            availability=availability,
+        )
+        records = await result.data()
+    return [PanelOut(**dict(r["p"])) for r in records]
+
+
+@app.get("/catalog/panels/{panel_sku}/accessories")
+async def panel_accessories(panel_sku: str):
+    async with get_session() as session:
+        result = await session.run(PANEL_ACCESSORIES, panelSku=panel_sku)
+        record = await result.single()
+    if record is None:
+        raise HTTPException(404, f"Panel {panel_sku} not found")
+    return {
+        "panel": dict(record["p"]),
+        "u_trims": [t for t in record["u_trims"] if t.get("sku")],
+        "l_trims": [t for t in record["l_trims"] if t.get("sku")],
+        "h_trims": [t for t in record["h_trims"] if t.get("sku")],
+        "metal_trims": [t for t in record["metal_trims"] if t.get("sku")],
+        "dedicated_led": [led for led in record["dedicated_led"] if led.get("sku")],
+        "universal_led": [led for led in record["universal_led"] if led.get("sku")],
+    }
+
+
+@app.get("/catalog/trims", response_model=list[TrimOut])
+async def list_trims(subcategory: str | None = Query(None)):
+    async with get_session() as session:
+        result = await session.run(ALL_TRIMS, subcategory=subcategory)
+        records = await result.data()
+    return [TrimOut(**dict(r["t"])) for r in records]
+
+
+@app.get("/catalog/consumables", response_model=list[ConsumableOut])
+async def list_consumables():
+    async with get_session() as session:
+        result = await session.run(ALL_CONSUMABLES)
+        records = await result.data()
+    return [ConsumableOut(**dict(r["c"])) for r in records]
+
+
+@app.get("/catalog/led-profiles", response_model=list[LEDProfileOut])
+async def list_led_profiles():
+    async with get_session() as session:
+        result = await session.run(ALL_LED_PROFILES)
+        records = await result.data()
+    return [LEDProfileOut(**dict(r["lp"])) for r in records]
+
+
+@app.get("/catalog/led-accessories")
+async def list_led_accessories():
+    async with get_session() as session:
+        result = await session.run(LED_STRIPS_AND_KITS)
+        records = await result.data()
+    return [dict(r["n"]) for r in records]
+
+
+@app.get("/catalog/furniture", response_model=list[FurnitureOut])
+async def list_furniture(subcategory: str | None = Query(None)):
+    async with get_session() as session:
+        result = await session.run(ALL_FURNITURE, subcategory=subcategory)
+        records = await result.data()
+    return [FurnitureOut(**dict(r["f"])) for r in records]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CART ENDPOINTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.post("/cart", response_model=CartOut)
+async def create_cart(body: CartCreateIn):
+    cart_id = body.cart_id or str(uuid.uuid4())
+
+    async with get_session() as session:
+        # Create cart node
+        await session.run(
+            CREATE_CART,
+            cartId=cart_id,
+            roomType=body.room_type,
+            isTwoZone=body.is_two_zone,
+            panelsReachFloor=body.panels_reach_floor,
+            wallWidthMm=body.wall_width_mm,
+            wallHeightMm=body.wall_height_mm,
+        )
+
+        # Add items
+        for item in body.items:
+            item_id = f"{cart_id}_{item.sku}_{uuid.uuid4().hex[:8]}"
+            await session.run(
+                ADD_CART_ITEM,
+                cartId=cart_id,
+                itemId=item_id,
+                sku=item.sku,
+                itemType=item.item_type,
+                quantity=item.quantity,
+                unitPrice=None,
+                source=item.source,
+                widthFt=item.width_ft,
+                zone=item.zone,
+            )
+
+        # Return full cart
+        result = await session.run(GET_CART, cartId=cart_id)
+        record = await result.single()
+
+    if record is None:
+        raise HTTPException(500, "Failed to create cart")
+
+    cart_node = dict(record["c"])
+    items = [CartItemOut(**dict(ci)) for ci in record["items"]]
+    return CartOut(
+        id=cart_node["id"],
+        status=cart_node.get("status", "DRAFT"),
+        room_type=cart_node.get("room_type", "any"),
+        is_two_zone=cart_node.get("is_two_zone", False),
+        panels_reach_floor=cart_node.get("panels_reach_floor", False),
+        wall_width_mm=_safe_int(cart_node.get("wall_width_mm")),
+        wall_height_mm=_safe_int(cart_node.get("wall_height_mm")),
+        items=items,
+    )
+
+
+@app.get("/cart/{cart_id}", response_model=CartOut)
+async def get_cart(cart_id: str):
+    async with get_session() as session:
+        result = await session.run(GET_CART, cartId=cart_id)
+        record = await result.single()
+    if record is None or record["c"] is None:
+        raise HTTPException(404, f"Cart {cart_id} not found")
+    cart_node = dict(record["c"])
+    items = [CartItemOut(**dict(ci)) for ci in record["items"]]
+    return CartOut(
+        id=cart_node["id"],
+        status=cart_node.get("status", "DRAFT"),
+        room_type=cart_node.get("room_type", "any"),
+        is_two_zone=cart_node.get("is_two_zone", False),
+        panels_reach_floor=cart_node.get("panels_reach_floor", False),
+        wall_width_mm=_safe_int(cart_node.get("wall_width_mm")),
+        wall_height_mm=_safe_int(cart_node.get("wall_height_mm")),
+        items=items,
+    )
+
+
+@app.post("/cart/{cart_id}/items", response_model=CartItemOut)
+async def add_item(cart_id: str, body: CartItemIn):
+    item_id = f"{cart_id}_{body.sku}_{uuid.uuid4().hex[:8]}"
+    async with get_session() as session:
+        result = await session.run(
+            ADD_CART_ITEM,
+            cartId=cart_id,
+            itemId=item_id,
+            sku=body.sku,
+            itemType=body.item_type,
+            quantity=body.quantity,
+            unitPrice=None,
+            source=body.source,
+            widthFt=body.width_ft,
+            zone=body.zone,
+        )
+        record = await result.single()
+    if record is None:
+        raise HTTPException(404, f"Cart {cart_id} not found")
+    return CartItemOut(**dict(record["ci"]))
+
+
+@app.delete("/cart/{cart_id}/items/{item_id}")
+async def remove_item(cart_id: str, item_id: str):
+    async with get_session() as session:
+        result = await session.run(REMOVE_CART_ITEM, cartId=cart_id, itemId=item_id)
+        record = await result.single()
+    if record is None or record["removed"] == 0:
+        raise HTTPException(404, "Item not found")
+    return {"removed": True}
+
+
+@app.delete("/cart/{cart_id}")
+async def delete_cart(cart_id: str):
+    async with get_session() as session:
+        result = await session.run(DELETE_CART, cartId=cart_id)
+        record = await result.single()
+    if record is None or record["deleted"] == 0:
+        raise HTTPException(404, f"Cart {cart_id} not found")
+    return {"deleted": True}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# VALIDATION ENDPOINT
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/cart/{cart_id}/validate", response_model=ValidationResult)
+async def validate_cart(cart_id: str):
+    async with get_session() as session:
+        result = await session.run(VALIDATE_CART, cartId=cart_id)
+        record = await result.single()
+    if record is None:
+        raise HTTPException(404, f"Cart {cart_id} not found or empty")
+
+    violations = [
+        Violation(
+            rule_id=v["rule_id"],
+            severity=v["severity"],
+            message=v["message"],
+            action=v.get("action"),
+            item=v.get("item"),
+        )
+        for v in record["violations"]
+        if v.get("rule_id") is not None
+    ]
+
+    return ValidationResult(
+        cart_id=record["cart_id"],
+        room_type=record["room_type"],
+        pass_fail=record["pass_fail"],
+        error_count=int(record["error_count"]),
+        warning_count=int(record["warning_count"]),
+        info_count=int(record["info_count"]),
+        violations=violations,
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BOM ENDPOINT
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/cart/{cart_id}/bom", response_model=BOMResult)
+async def get_bom(cart_id: str):
+    panels: list[BOMPanelEntry] = []
+
+    async with get_session() as session:
+        # Consumables per panel
+        result = await session.run(BOM_CONSUMABLES, cartId=cart_id)
+        records = await result.data()
+        for r in records:
+            panels.append(
+                BOMPanelEntry(
+                    panel_sku=r["panel_sku"],
+                    install_method=r.get("install_method"),
+                    required_consumables=[BOMConsumable(**c) for c in r.get("required", []) if c.get("sku")],
+                    optional_consumables=[BOMConsumable(**c) for c in r.get("optional", []) if c.get("sku")],
+                )
+            )
+
+        # Trims per panel
+        result = await session.run(BOM_TRIMS, cartId=cart_id)
+        records = await result.data()
+        trim_map: dict[str, list[BOMTrim]] = {}
+        for r in records:
+            trim_map[r["panel_sku"]] = [
+                BOMTrim(
+                    sku=t["sku"],
+                    name=t.get("name"),
+                    price=_safe_int(t.get("price")),
+                    trim_type=t.get("type"),
+                    suggestion=t.get("suggestion"),
+                )
+                for t in r.get("trims", [])
+                if t.get("sku")
+            ]
+
+        for panel_entry in panels:
+            panel_entry.suggested_trims = trim_map.get(panel_entry.panel_sku, [])
+
+    return BOMResult(cart_id=cart_id, panels=panels)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# EVALUATE (COMBINED VALIDATION + BOM)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/cart/{cart_id}/evaluate", response_model=EvaluateResult)
+async def evaluate_cart(cart_id: str):
+    validation = await validate_cart(cart_id)
+    bom = await get_bom(cart_id)
+    return EvaluateResult(
+        cart_id=validation.cart_id,
+        room_type=validation.room_type,
+        pass_fail=validation.pass_fail,
+        error_count=validation.error_count,
+        warning_count=validation.warning_count,
+        info_count=validation.info_count,
+        violations=validation.violations,
+        bom=bom,
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DEFAULTS & ROOM AFFINITY
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/defaults/{room_type}", response_model=DefaultPanelOut)
+async def default_panel(room_type: str):
+    async with get_session() as session:
+        result = await session.run(DEFAULT_PANEL_FOR_ROOM)
+        record = await result.single()
+
+    if record is None:
+        raise HTTPException(404, "Default selection rules not loaded")
+
+    defaults_json = record["raw"]
+    try:
+        defaults = json.loads(defaults_json)
+    except (json.JSONDecodeError, TypeError):
+        defaults = {}
+
+    suggested_sku = defaults.get(room_type, defaults.get("any"))
+    panel = None
+
+    if suggested_sku:
+        async with get_session() as session:
+            result = await session.run(
+                "MATCH (p:Panel {sku: $sku}) RETURN p",
+                sku=suggested_sku,
+            )
+            rec = await result.single()
+            if rec:
+                panel = PanelOut(**dict(rec["p"]))
+
+    return DefaultPanelOut(room_type=room_type, suggested_sku=suggested_sku, panel=panel)
+
+
+@app.get("/catalog/panels/ranked/{room_type}")
+async def ranked_panels(room_type: str):
+    async with get_session() as session:
+        result = await session.run(ROOM_RANKED_PANELS)
+        records = await result.data()
+
+    ranked = []
+    for r in records:
+        affinity_raw = r.get("room_affinity", "{}")
+        try:
+            affinity = json.loads(affinity_raw) if affinity_raw else {}
+        except (json.JSONDecodeError, TypeError):
+            affinity = {}
+        score = affinity.get(room_type, affinity.get("any", 0.0))
+        ranked.append(
+            {
+                "sku": r["sku"],
+                "name": r["name"],
+                "price": r.get("price"),
+                "subcategory": r["subcategory"],
+                "availability": r["availability"],
+                "affinity_score": score,
+                "default_selection": r.get("default_selection", False),
+            }
+        )
+
+    ranked.sort(key=lambda x: x["affinity_score"], reverse=True)
+    return ranked
