@@ -8,24 +8,29 @@ WHERE ($subcategory IS NULL OR p.subcategory = $subcategory)
   AND ($availability IS NULL OR p.availability = $availability)
   AND p.availability <> 'UNAVAILABLE'
 RETURN p ORDER BY p.subcategory, p.name
+SKIP $skip LIMIT $limit
 """
 
 ALL_TRIMS = """
 MATCH (t:Trim)
 WHERE ($subcategory IS NULL OR t.subcategory = $subcategory)
 RETURN t ORDER BY t.subcategory, t.name
+SKIP $skip LIMIT $limit
 """
 
 ALL_CONSUMABLES = """
 MATCH (c:Consumable) RETURN c ORDER BY c.name
+SKIP $skip LIMIT $limit
 """
 
 ALL_LED_PROFILES = """
 MATCH (lp:LEDProfile) RETURN lp ORDER BY lp.name
+SKIP $skip LIMIT $limit
 """
 
 LED_STRIPS_AND_KITS = """
 MATCH (n) WHERE n:LEDStrip OR n:LEDKit RETURN n ORDER BY labels(n)[0], n.name
+SKIP $skip LIMIT $limit
 """
 
 ALL_FURNITURE = """
@@ -33,6 +38,7 @@ MATCH (f:Furniture)
 WHERE ($subcategory IS NULL OR f.subcategory = $subcategory)
   AND f.availability <> 'UNAVAILABLE'
 RETURN f ORDER BY f.subcategory, f.name
+SKIP $skip LIMIT $limit
 """
 
 PANEL_ACCESSORIES = """
