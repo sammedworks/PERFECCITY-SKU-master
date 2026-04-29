@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import settings
 from app.db import close_driver, get_session, init_driver
@@ -55,12 +57,22 @@ from app.queries import (
     VALIDATION_GROUPS,
 )
 
+logger = logging.getLogger("perfeccity")
+
+DEFAULT_PAGE_SIZE = 100
+MAX_PAGE_SIZE = 500
+
 # ── App lifecycle ────────────────────────────────────────────────────────────
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
     await init_driver()
+    logger.info("Neo4j driver initialised")
     yield
     await close_driver()
 
@@ -77,6 +89,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        request.state.request_id = request_id
+        logger.info(
+            "request_start",
+            extra={"request_id": request_id, "method": request.method, "path": request.url.path},
+        )
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            "request_end",
+            extra={"request_id": request_id, "status": response.status_code},
+        )
+        return response
+
+
+app.add_middleware(RequestIDMiddleware)
 
 
 # ── API Key Auth ─────────────────────────────────────────────────────────────
@@ -124,12 +156,16 @@ async def health():
 async def list_panels(
     subcategory: str | None = Query(None, description="Filter by subcategory"),
     availability: str | None = Query(None, description="Filter by availability"),
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE, description="Max records to return"),
 ):
     async with get_session() as session:
         result = await session.run(
             PANELS_BY_SUBCATEGORY,
             subcategory=subcategory,
             availability=availability,
+            skip=skip,
+            limit=limit,
         )
         records = await result.data()
     return [PanelOut(**dict(r["p"])) for r in records]
@@ -154,41 +190,58 @@ async def panel_accessories(panel_sku: str):
 
 
 @app.get("/catalog/trims", response_model=list[TrimOut])
-async def list_trims(subcategory: str | None = Query(None)):
+async def list_trims(
+    subcategory: str | None = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
     async with get_session() as session:
-        result = await session.run(ALL_TRIMS, subcategory=subcategory)
+        result = await session.run(ALL_TRIMS, subcategory=subcategory, skip=skip, limit=limit)
         records = await result.data()
     return [TrimOut(**dict(r["t"])) for r in records]
 
 
 @app.get("/catalog/consumables", response_model=list[ConsumableOut])
-async def list_consumables():
+async def list_consumables(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
     async with get_session() as session:
-        result = await session.run(ALL_CONSUMABLES)
+        result = await session.run(ALL_CONSUMABLES, skip=skip, limit=limit)
         records = await result.data()
     return [ConsumableOut(**dict(r["c"])) for r in records]
 
 
 @app.get("/catalog/led-profiles", response_model=list[LEDProfileOut])
-async def list_led_profiles():
+async def list_led_profiles(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
     async with get_session() as session:
-        result = await session.run(ALL_LED_PROFILES)
+        result = await session.run(ALL_LED_PROFILES, skip=skip, limit=limit)
         records = await result.data()
     return [LEDProfileOut(**dict(r["lp"])) for r in records]
 
 
 @app.get("/catalog/led-accessories")
-async def list_led_accessories():
+async def list_led_accessories(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
     async with get_session() as session:
-        result = await session.run(LED_STRIPS_AND_KITS)
+        result = await session.run(LED_STRIPS_AND_KITS, skip=skip, limit=limit)
         records = await result.data()
     return [dict(r["n"]) for r in records]
 
 
 @app.get("/catalog/furniture", response_model=list[FurnitureOut])
-async def list_furniture(subcategory: str | None = Query(None)):
+async def list_furniture(
+    subcategory: str | None = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
     async with get_session() as session:
-        result = await session.run(ALL_FURNITURE, subcategory=subcategory)
+        result = await session.run(ALL_FURNITURE, subcategory=subcategory, skip=skip, limit=limit)
         records = await result.data()
     return [FurnitureOut(**dict(r["f"])) for r in records]
 
