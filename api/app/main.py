@@ -38,6 +38,7 @@ from app.queries import (
     ALL_TRIMS,
     BOM_CONSUMABLES,
     BOM_TRIMS,
+    CART_META,
     CREATE_CART,
     DEFAULT_PANEL_FOR_ROOM,
     DELETE_CART,
@@ -47,7 +48,7 @@ from app.queries import (
     PANELS_BY_SUBCATEGORY,
     REMOVE_CART_ITEM,
     ROOM_RANKED_PANELS,
-    VALIDATE_CART,
+    VALIDATION_GROUPS,
 )
 
 # ── App lifecycle ────────────────────────────────────────────────────────────
@@ -308,11 +309,35 @@ async def delete_cart(cart_id: str):
 
 @app.get("/cart/{cart_id}/validate", response_model=ValidationResult)
 async def validate_cart(cart_id: str):
+    """Run all validation rule groups in one read transaction, merge results."""
+
+    async def _run_validation(tx):
+        # 1. Fetch cart metadata (cart_id, room_type)
+        meta_result = await tx.run(CART_META, cartId=cart_id)
+        meta_record = await meta_result.single()
+        if meta_record is None:
+            return None
+
+        meta = {
+            "cart_id": meta_record["cart_id"],
+            "room_type": meta_record["room_type"],
+        }
+
+        # 2. Run each validation group and collect violations
+        all_violations: list[dict] = []
+        for _group_name, query in VALIDATION_GROUPS:
+            result = await tx.run(query, cartId=cart_id)
+            record = await result.single()
+            if record is not None:
+                all_violations.extend(record["violations"])
+
+        return {"meta": meta, "violations": all_violations}
+
     async with get_session() as session:
-        result = await session.run(VALIDATE_CART, cartId=cart_id)
-        record = await result.single()
-    if record is None:
-        raise HTTPException(404, f"Cart {cart_id} not found or empty")
+        data = await session.execute_read(_run_validation)
+
+    if data is None:
+        raise HTTPException(404, f"Cart {cart_id} not found")
 
     violations = [
         Violation(
@@ -322,17 +347,21 @@ async def validate_cart(cart_id: str):
             action=v.get("action"),
             item=v.get("item"),
         )
-        for v in record["violations"]
+        for v in data["violations"]
         if v.get("rule_id") is not None
     ]
 
+    error_count = sum(1 for v in violations if v.severity == "ERROR")
+    warning_count = sum(1 for v in violations if v.severity == "WARNING")
+    info_count = sum(1 for v in violations if v.severity == "INFO")
+
     return ValidationResult(
-        cart_id=record["cart_id"],
-        room_type=record["room_type"],
-        pass_fail=record["pass_fail"],
-        error_count=int(record["error_count"]),
-        warning_count=int(record["warning_count"]),
-        info_count=int(record["info_count"]),
+        cart_id=data["meta"]["cart_id"],
+        room_type=data["meta"]["room_type"],
+        pass_fail="FAIL" if error_count > 0 else "PASS",
+        error_count=error_count,
+        warning_count=warning_count,
+        info_count=info_count,
         violations=violations,
     )
 
