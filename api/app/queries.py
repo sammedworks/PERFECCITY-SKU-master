@@ -135,7 +135,8 @@ RETURN count(*) AS deleted
 # Neo4j Browser or cypher-shell.
 
 _CART_PREAMBLE = """
-MATCH (cart:Cart {id: $cartId})-[:CONTAINS_ITEM]->(ci:CartItem)
+MATCH (cart:Cart {id: $cartId})
+OPTIONAL MATCH (cart)-[:CONTAINS_ITEM]->(ci:CartItem)
 WITH cart,
      collect(ci) AS all_items,
      collect(ci.sku) AS all_skus,

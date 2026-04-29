@@ -309,24 +309,35 @@ async def delete_cart(cart_id: str):
 
 @app.get("/cart/{cart_id}/validate", response_model=ValidationResult)
 async def validate_cart(cart_id: str):
-    """Run all validation rule groups within one session, merge results."""
-    async with get_session() as session:
+    """Run all validation rule groups in one read transaction, merge results."""
+
+    async def _run_validation(tx):
         # 1. Fetch cart metadata (cart_id, room_type)
-        meta_result = await session.run(CART_META, cartId=cart_id)
+        meta_result = await tx.run(CART_META, cartId=cart_id)
         meta_record = await meta_result.single()
         if meta_record is None:
-            raise HTTPException(404, f"Cart {cart_id} not found or empty")
+            return None
 
-        cart_id_val = meta_record["cart_id"]
-        room_type = meta_record["room_type"]
+        meta = {
+            "cart_id": meta_record["cart_id"],
+            "room_type": meta_record["room_type"],
+        }
 
         # 2. Run each validation group and collect violations
         all_violations: list[dict] = []
         for _group_name, query in VALIDATION_GROUPS:
-            result = await session.run(query, cartId=cart_id)
+            result = await tx.run(query, cartId=cart_id)
             record = await result.single()
             if record is not None:
                 all_violations.extend(record["violations"])
+
+        return {"meta": meta, "violations": all_violations}
+
+    async with get_session() as session:
+        data = await session.execute_read(_run_validation)
+
+    if data is None:
+        raise HTTPException(404, f"Cart {cart_id} not found")
 
     violations = [
         Violation(
@@ -336,7 +347,7 @@ async def validate_cart(cart_id: str):
             action=v.get("action"),
             item=v.get("item"),
         )
-        for v in all_violations
+        for v in data["violations"]
         if v.get("rule_id") is not None
     ]
 
@@ -345,8 +356,8 @@ async def validate_cart(cart_id: str):
     info_count = sum(1 for v in violations if v.severity == "INFO")
 
     return ValidationResult(
-        cart_id=cart_id_val,
-        room_type=room_type,
+        cart_id=data["meta"]["cart_id"],
+        room_type=data["meta"]["room_type"],
         pass_fail="FAIL" if error_count > 0 else "PASS",
         error_count=error_count,
         warning_count=warning_count,
