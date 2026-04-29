@@ -67,30 +67,30 @@ SET c.status = 'DRAFT',
 RETURN c
 """
 
+RESOLVE_PRODUCT = """
+MATCH (product)
+WHERE (product:Panel OR product:Trim OR product:Consumable
+  OR product:LEDProfile OR product:LEDStrip OR product:LEDKit OR product:Furniture)
+  AND product.sku = $sku
+RETURN product.sku AS sku, product.price AS price
+"""
+
 ADD_CART_ITEM = """
 MATCH (c:Cart {id: $cartId})
+MATCH (product)
+  WHERE (product:Panel OR product:Trim OR product:Consumable
+    OR product:LEDProfile OR product:LEDStrip OR product:LEDKit OR product:Furniture)
+  AND product.sku = $sku
 MERGE (ci:CartItem {id: $itemId})
 SET ci.sku = $sku,
     ci.item_type = $itemType,
     ci.quantity = $quantity,
-    ci.unit_price = $unitPrice,
+    ci.unit_price = COALESCE($unitPrice, product.price),
     ci.source = $source,
     ci.width_ft = $widthFt,
     ci.zone = $zone
 MERGE (c)-[:CONTAINS_ITEM]->(ci)
-WITH ci
-OPTIONAL MATCH (product)
-  WHERE (product:Panel OR product:Trim OR product:Consumable
-    OR product:LEDProfile OR product:LEDStrip OR product:LEDKit OR product:Furniture)
-  AND product.sku = ci.sku
-FOREACH (_ IN CASE WHEN product IS NOT NULL THEN [1] ELSE [] END |
-  MERGE (ci)-[:REFERENCES]->(product)
-)
-WITH ci
-OPTIONAL MATCH (product) WHERE (product:Panel OR product:Trim OR product:Consumable
-  OR product:LEDProfile OR product:LEDStrip OR product:LEDKit OR product:Furniture)
-  AND product.sku = ci.sku
-SET ci.unit_price = CASE WHEN ci.unit_price IS NULL AND product IS NOT NULL THEN product.price ELSE ci.unit_price END
+MERGE (ci)-[:REFERENCES]->(product)
 RETURN ci
 """
 

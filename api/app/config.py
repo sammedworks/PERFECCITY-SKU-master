@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     app_version: str = "1.0.0"
     cors_origins: list[str] = ["*"]
 
+    # API key auth — set via PERFECCITY_API_KEY env var. Empty = auth disabled.
+    api_key: str = ""
+
     model_config = {"env_prefix": "PERFECCITY_"}
 
 
