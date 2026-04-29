@@ -469,15 +469,17 @@ VALIDATION_GROUPS: list[tuple[str, str]] = [
 
 BOM_CONSUMABLES = """
 MATCH (cart:Cart {id: $cartId})-[:CONTAINS_ITEM]->(ci:CartItem {item_type:'PANEL'})
-MATCH (panel:Panel {sku: ci.sku})-[:BELONGS_TO]->(subcat:Subcategory)
+MATCH (panel:Panel {sku: ci.sku})
+OPTIONAL MATCH (panel)-[:BELONGS_TO]->(subcat:Subcategory)
 OPTIONAL MATCH (panelRule:Rule {type:'INSTALLATION_CONTRACT'})-[:APPLIES_TO]->(panel)
 OPTIONAL MATCH (subcatRule:Rule {type:'INSTALLATION_CONTRACT'})-[:APPLIES_TO]->(subcat)
-WITH ci, panel, subcat, CASE WHEN panelRule IS NOT NULL THEN panelRule ELSE subcatRule END AS contract
+WITH ci, panel, CASE WHEN panelRule IS NOT NULL THEN panelRule ELSE subcatRule END AS contract
 OPTIONAL MATCH (contract)-[req:REQUIRES_CONSUMABLE]->(rc:Consumable)
 WITH ci, panel, contract, collect(DISTINCT {sku:rc.sku, name:rc.name, price:rc.price, status:'REQUIRED'}) AS required
 OPTIONAL MATCH (contract)-[opt:OPTIONAL_CONSUMABLE]->(oc:Consumable)
 WITH ci, panel, contract, required, collect(DISTINCT {sku:oc.sku, name:oc.name, price:oc.price, condition:opt.condition, status:'OPTIONAL'}) AS optional
-RETURN ci.sku AS panel_sku, panel.name AS panel_name, contract.method AS install_method,
+RETURN ci.sku AS panel_sku, panel.name AS panel_name,
+  COALESCE(contract.method, 'UNKNOWN') AS install_method,
   [r IN required WHERE r.sku IS NOT NULL] AS required,
   [o IN optional WHERE o.sku IS NOT NULL] AS optional
 ORDER BY ci.sku
