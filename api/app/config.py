@@ -11,7 +11,7 @@ class Settings(BaseSettings):
 
     app_title: str = "Perfeccity Wall Configurator API"
     app_version: str = "1.0.0"
-    cors_origins: list[str] = ["*"]
+    cors_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
     # API key auth — set via PERFECCITY_API_KEY env var. Empty = auth disabled.
     api_key: str = ""
