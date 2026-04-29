@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 
@@ -88,7 +89,7 @@ async def require_api_key(
     """Validate API key if configured. Skips auth when PERFECCITY_API_KEY is empty."""
     if not settings.api_key:
         return None
-    if api_key != settings.api_key:
+    if not secrets.compare_digest(api_key or "", settings.api_key):
         raise HTTPException(403, "Invalid or missing API key")
     return api_key
 
