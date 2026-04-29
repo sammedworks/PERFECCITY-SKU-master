@@ -6,8 +6,9 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 
 from app.config import settings
 from app.db import close_driver, get_session, init_driver
@@ -47,6 +48,7 @@ from app.queries import (
     PANEL_ACCESSORIES,
     PANELS_BY_SUBCATEGORY,
     REMOVE_CART_ITEM,
+    RESOLVE_PRODUCT,
     ROOM_RANKED_PANELS,
     VALIDATION_GROUPS,
 )
@@ -73,6 +75,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── API Key Auth ─────────────────────────────────────────────────────────────
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def require_api_key(
+    api_key: str | None = Security(_api_key_header),
+) -> str | None:
+    """Validate API key if configured. Skips auth when PERFECCITY_API_KEY is empty."""
+    if not settings.api_key:
+        return None
+    if api_key != settings.api_key:
+        raise HTTPException(403, "Invalid or missing API key")
+    return api_key
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -186,11 +204,20 @@ async def list_furniture(subcategory: str | None = Query(None)):
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-@app.post("/cart", response_model=CartOut)
+@app.post("/cart", response_model=CartOut, dependencies=[Depends(require_api_key)])
 async def create_cart(body: CartCreateIn):
     cart_id = body.cart_id or str(uuid.uuid4())
 
     async with get_session() as session:
+        # Validate all SKUs exist in catalog before touching cart
+        for item in body.items:
+            result = await session.run(RESOLVE_PRODUCT, sku=item.sku)
+            if await result.single() is None:
+                raise HTTPException(
+                    404,
+                    f"Product '{item.sku}' not found in catalog",
+                )
+
         # Create cart node
         await session.run(
             CREATE_CART,
@@ -202,7 +229,7 @@ async def create_cart(body: CartCreateIn):
             wallHeightMm=body.wall_height_mm,
         )
 
-        # Add items
+        # Add items (product MATCH guaranteed to succeed after validation)
         for item in body.items:
             item_id = f"{cart_id}_{item.sku}_{uuid.uuid4().hex[:8]}"
             await session.run(
@@ -260,10 +287,15 @@ async def get_cart(cart_id: str):
     )
 
 
-@app.post("/cart/{cart_id}/items", response_model=CartItemOut)
+@app.post("/cart/{cart_id}/items", response_model=CartItemOut, dependencies=[Depends(require_api_key)])
 async def add_item(cart_id: str, body: CartItemIn):
-    item_id = f"{cart_id}_{body.sku}_{uuid.uuid4().hex[:8]}"
     async with get_session() as session:
+        # Validate SKU exists
+        prod_result = await session.run(RESOLVE_PRODUCT, sku=body.sku)
+        if await prod_result.single() is None:
+            raise HTTPException(404, f"Product '{body.sku}' not found in catalog")
+
+        item_id = f"{cart_id}_{body.sku}_{uuid.uuid4().hex[:8]}"
         result = await session.run(
             ADD_CART_ITEM,
             cartId=cart_id,
@@ -282,7 +314,7 @@ async def add_item(cart_id: str, body: CartItemIn):
     return CartItemOut(**dict(record["ci"]))
 
 
-@app.delete("/cart/{cart_id}/items/{item_id}")
+@app.delete("/cart/{cart_id}/items/{item_id}", dependencies=[Depends(require_api_key)])
 async def remove_item(cart_id: str, item_id: str):
     async with get_session() as session:
         result = await session.run(REMOVE_CART_ITEM, cartId=cart_id, itemId=item_id)
@@ -292,7 +324,7 @@ async def remove_item(cart_id: str, item_id: str):
     return {"removed": True}
 
 
-@app.delete("/cart/{cart_id}")
+@app.delete("/cart/{cart_id}", dependencies=[Depends(require_api_key)])
 async def delete_cart(cart_id: str):
     async with get_session() as session:
         result = await session.run(DELETE_CART, cartId=cart_id)
@@ -419,16 +451,100 @@ async def get_bom(cart_id: str):
 
 @app.get("/cart/{cart_id}/evaluate", response_model=EvaluateResult)
 async def evaluate_cart(cart_id: str):
-    validation = await validate_cart(cart_id)
-    bom = await get_bom(cart_id)
+    """Run validation + BOM in a single read transaction for snapshot consistency."""
+
+    async def _run_evaluate(tx):
+        # ── Validation ──
+        meta_result = await tx.run(CART_META, cartId=cart_id)
+        meta_record = await meta_result.single()
+        if meta_record is None:
+            return None
+
+        meta = {
+            "cart_id": meta_record["cart_id"],
+            "room_type": meta_record["room_type"],
+        }
+
+        all_violations: list[dict] = []
+        for _group_name, query in VALIDATION_GROUPS:
+            result = await tx.run(query, cartId=cart_id)
+            record = await result.single()
+            if record is not None:
+                all_violations.extend(record["violations"])
+
+        # ── BOM ──
+        bom_result = await tx.run(BOM_CONSUMABLES, cartId=cart_id)
+        bom_records = await bom_result.data()
+
+        trim_result = await tx.run(BOM_TRIMS, cartId=cart_id)
+        trim_records = await trim_result.data()
+
+        return {
+            "meta": meta,
+            "violations": all_violations,
+            "bom_records": bom_records,
+            "trim_records": trim_records,
+        }
+
+    async with get_session() as session:
+        data = await session.execute_read(_run_evaluate)
+
+    if data is None:
+        raise HTTPException(404, f"Cart {cart_id} not found")
+
+    # Build violations
+    violations = [
+        Violation(
+            rule_id=v["rule_id"],
+            severity=v["severity"],
+            message=v["message"],
+            action=v.get("action"),
+            item=v.get("item"),
+        )
+        for v in data["violations"]
+        if v.get("rule_id") is not None
+    ]
+    error_count = sum(1 for v in violations if v.severity == "ERROR")
+    warning_count = sum(1 for v in violations if v.severity == "WARNING")
+    info_count = sum(1 for v in violations if v.severity == "INFO")
+
+    # Build BOM
+    panels: list[BOMPanelEntry] = []
+    for r in data["bom_records"]:
+        panels.append(
+            BOMPanelEntry(
+                panel_sku=r["panel_sku"],
+                install_method=r.get("install_method"),
+                required_consumables=[BOMConsumable(**c) for c in r.get("required", []) if c.get("sku")],
+                optional_consumables=[BOMConsumable(**c) for c in r.get("optional", []) if c.get("sku")],
+            )
+        )
+    trim_map: dict[str, list[BOMTrim]] = {}
+    for r in data["trim_records"]:
+        trim_map[r["panel_sku"]] = [
+            BOMTrim(
+                sku=t["sku"],
+                name=t.get("name"),
+                price=_safe_int(t.get("price")),
+                trim_type=t.get("type"),
+                suggestion=t.get("suggestion"),
+            )
+            for t in r.get("trims", [])
+            if t.get("sku")
+        ]
+    for panel_entry in panels:
+        panel_entry.suggested_trims = trim_map.get(panel_entry.panel_sku, [])
+
+    bom = BOMResult(cart_id=cart_id, panels=panels)
+
     return EvaluateResult(
-        cart_id=validation.cart_id,
-        room_type=validation.room_type,
-        pass_fail=validation.pass_fail,
-        error_count=validation.error_count,
-        warning_count=validation.warning_count,
-        info_count=validation.info_count,
-        violations=validation.violations,
+        cart_id=data["meta"]["cart_id"],
+        room_type=data["meta"]["room_type"],
+        pass_fail="FAIL" if error_count > 0 else "PASS",
+        error_count=error_count,
+        warning_count=warning_count,
+        info_count=info_count,
+        violations=violations,
         bom=bom,
     )
 

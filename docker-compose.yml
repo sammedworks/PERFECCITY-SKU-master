@@ -27,6 +27,7 @@ services:
       PERFECCITY_NEO4J_USER: neo4j
       PERFECCITY_NEO4J_PASSWORD: perfeccity123
       PERFECCITY_CORS_ORIGINS: '["*"]'
+      PERFECCITY_API_KEY: ${PERFECCITY_API_KEY:-}
     depends_on:
       neo4j:
         condition: service_healthy
