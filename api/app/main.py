@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 
 from app.config import settings
-from app.db import close_driver, get_session, init_driver
+from app.db import close_driver, get_driver, get_session, init_driver
 from app.models import (
     BOMConsumable,
     BOMPanelEntry,
@@ -113,6 +113,17 @@ def _safe_int(val) -> int | None:
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": settings.app_version}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """Deep health check — verifies Neo4j connectivity."""
+    try:
+        driver = get_driver()
+        await driver.verify_connectivity()
+        return {"status": "ok", "neo4j": "connected", "version": settings.app_version}
+    except Exception as exc:
+        raise HTTPException(503, f"Neo4j unreachable: {exc}") from exc
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -261,7 +272,7 @@ async def create_cart(body: CartCreateIn):
     )
 
 
-@app.get("/cart/{cart_id}", response_model=CartOut)
+@app.get("/cart/{cart_id}", response_model=CartOut, dependencies=[Depends(require_api_key)])
 async def get_cart(cart_id: str):
     async with get_session() as session:
         result = await session.run(GET_CART, cartId=cart_id)
@@ -330,42 +341,37 @@ async def delete_cart(cart_id: str):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# VALIDATION ENDPOINT
+# SHARED: VALIDATION + BOM BUILDING
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-@app.get("/cart/{cart_id}/validate", response_model=ValidationResult)
-async def validate_cart(cart_id: str):
-    """Run all validation rule groups in one read transaction, merge results."""
+async def _tx_fetch_meta(tx, cart_id: str) -> dict | None:
+    meta_result = await tx.run(CART_META, cartId=cart_id)
+    meta_record = await meta_result.single()
+    if meta_record is None:
+        return None
+    return {"cart_id": meta_record["cart_id"], "room_type": meta_record["room_type"]}
 
-    async def _run_validation(tx):
-        # 1. Fetch cart metadata (cart_id, room_type)
-        meta_result = await tx.run(CART_META, cartId=cart_id)
-        meta_record = await meta_result.single()
-        if meta_record is None:
-            return None
 
-        meta = {
-            "cart_id": meta_record["cart_id"],
-            "room_type": meta_record["room_type"],
-        }
+async def _tx_fetch_violations(tx, cart_id: str) -> list[dict]:
+    all_violations: list[dict] = []
+    for _group_name, query in VALIDATION_GROUPS:
+        result = await tx.run(query, cartId=cart_id)
+        record = await result.single()
+        if record is not None:
+            all_violations.extend(record["violations"])
+    return all_violations
 
-        # 2. Run each validation group and collect violations
-        all_violations: list[dict] = []
-        for _group_name, query in VALIDATION_GROUPS:
-            result = await tx.run(query, cartId=cart_id)
-            record = await result.single()
-            if record is not None:
-                all_violations.extend(record["violations"])
 
-        return {"meta": meta, "violations": all_violations}
+async def _tx_fetch_bom(tx, cart_id: str) -> dict:
+    bom_result = await tx.run(BOM_CONSUMABLES, cartId=cart_id)
+    bom_records = await bom_result.data()
+    trim_result = await tx.run(BOM_TRIMS, cartId=cart_id)
+    trim_records = await trim_result.data()
+    return {"bom_records": bom_records, "trim_records": trim_records}
 
-    async with get_session() as session:
-        data = await session.execute_read(_run_validation)
 
-    if data is None:
-        raise HTTPException(404, f"Cart {cart_id} not found")
-
+def _build_violations(raw: list[dict]) -> tuple[list[Violation], int, int, int]:
     violations = [
         Violation(
             rule_id=v["rule_id"],
@@ -374,14 +380,67 @@ async def validate_cart(cart_id: str):
             action=v.get("action"),
             item=v.get("item"),
         )
-        for v in data["violations"]
+        for v in raw
         if v.get("rule_id") is not None
     ]
-
     error_count = sum(1 for v in violations if v.severity == "ERROR")
     warning_count = sum(1 for v in violations if v.severity == "WARNING")
     info_count = sum(1 for v in violations if v.severity == "INFO")
+    return violations, error_count, warning_count, info_count
 
+
+def _build_bom(cart_id: str, bom_records: list, trim_records: list) -> BOMResult:
+    panels: list[BOMPanelEntry] = []
+    for r in bom_records:
+        panels.append(
+            BOMPanelEntry(
+                panel_sku=r["panel_sku"],
+                install_method=r.get("install_method"),
+                required_consumables=[BOMConsumable(**c) for c in r.get("required", []) if c.get("sku")],
+                optional_consumables=[BOMConsumable(**c) for c in r.get("optional", []) if c.get("sku")],
+            )
+        )
+    trim_map: dict[str, list[BOMTrim]] = {}
+    for r in trim_records:
+        trim_map[r["panel_sku"]] = [
+            BOMTrim(
+                sku=t["sku"],
+                name=t.get("name"),
+                price=_safe_int(t.get("price")),
+                trim_type=t.get("type"),
+                suggestion=t.get("suggestion"),
+            )
+            for t in r.get("trims", [])
+            if t.get("sku")
+        ]
+    for panel_entry in panels:
+        panel_entry.suggested_trims = trim_map.get(panel_entry.panel_sku, [])
+    return BOMResult(cart_id=cart_id, panels=panels)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# VALIDATION ENDPOINT
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/cart/{cart_id}/validate", response_model=ValidationResult)
+async def validate_cart(cart_id: str):
+    """Run all validation rule groups in one read transaction."""
+
+    async def _run(tx):
+        meta = await _tx_fetch_meta(tx, cart_id)
+        if meta is None:
+            return None
+        raw_violations = await _tx_fetch_violations(tx, cart_id)
+        return {"meta": meta, "violations": raw_violations}
+
+    async with get_session() as session:
+        data = await session.execute_read(_run)
+
+    if data is None:
+        raise HTTPException(404, f"Cart {cart_id} not found")
+
+    violations, error_count, warning_count, info_count = _build_violations(data["violations"])
     return ValidationResult(
         cart_id=data["meta"]["cart_id"],
         room_type=data["meta"]["room_type"],
@@ -400,43 +459,19 @@ async def validate_cart(cart_id: str):
 
 @app.get("/cart/{cart_id}/bom", response_model=BOMResult)
 async def get_bom(cart_id: str):
-    panels: list[BOMPanelEntry] = []
+    async with get_session() as session:
+        result = await session.run(GET_CART, cartId=cart_id)
+        record = await result.single()
+    if record is None or record["c"] is None:
+        raise HTTPException(404, f"Cart {cart_id} not found")
+
+    async def _run(tx):
+        return await _tx_fetch_bom(tx, cart_id)
 
     async with get_session() as session:
-        # Consumables per panel
-        result = await session.run(BOM_CONSUMABLES, cartId=cart_id)
-        records = await result.data()
-        for r in records:
-            panels.append(
-                BOMPanelEntry(
-                    panel_sku=r["panel_sku"],
-                    install_method=r.get("install_method"),
-                    required_consumables=[BOMConsumable(**c) for c in r.get("required", []) if c.get("sku")],
-                    optional_consumables=[BOMConsumable(**c) for c in r.get("optional", []) if c.get("sku")],
-                )
-            )
+        data = await session.execute_read(_run)
 
-        # Trims per panel
-        result = await session.run(BOM_TRIMS, cartId=cart_id)
-        records = await result.data()
-        trim_map: dict[str, list[BOMTrim]] = {}
-        for r in records:
-            trim_map[r["panel_sku"]] = [
-                BOMTrim(
-                    sku=t["sku"],
-                    name=t.get("name"),
-                    price=_safe_int(t.get("price")),
-                    trim_type=t.get("type"),
-                    suggestion=t.get("suggestion"),
-                )
-                for t in r.get("trims", [])
-                if t.get("sku")
-            ]
-
-        for panel_entry in panels:
-            panel_entry.suggested_trims = trim_map.get(panel_entry.panel_sku, [])
-
-    return BOMResult(cart_id=cart_id, panels=panels)
+    return _build_bom(cart_id, data["bom_records"], data["trim_records"])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -448,89 +483,22 @@ async def get_bom(cart_id: str):
 async def evaluate_cart(cart_id: str):
     """Run validation + BOM in a single read transaction for snapshot consistency."""
 
-    async def _run_evaluate(tx):
-        # ── Validation ──
-        meta_result = await tx.run(CART_META, cartId=cart_id)
-        meta_record = await meta_result.single()
-        if meta_record is None:
+    async def _run(tx):
+        meta = await _tx_fetch_meta(tx, cart_id)
+        if meta is None:
             return None
-
-        meta = {
-            "cart_id": meta_record["cart_id"],
-            "room_type": meta_record["room_type"],
-        }
-
-        all_violations: list[dict] = []
-        for _group_name, query in VALIDATION_GROUPS:
-            result = await tx.run(query, cartId=cart_id)
-            record = await result.single()
-            if record is not None:
-                all_violations.extend(record["violations"])
-
-        # ── BOM ──
-        bom_result = await tx.run(BOM_CONSUMABLES, cartId=cart_id)
-        bom_records = await bom_result.data()
-
-        trim_result = await tx.run(BOM_TRIMS, cartId=cart_id)
-        trim_records = await trim_result.data()
-
-        return {
-            "meta": meta,
-            "violations": all_violations,
-            "bom_records": bom_records,
-            "trim_records": trim_records,
-        }
+        raw_violations = await _tx_fetch_violations(tx, cart_id)
+        bom_data = await _tx_fetch_bom(tx, cart_id)
+        return {"meta": meta, "violations": raw_violations, **bom_data}
 
     async with get_session() as session:
-        data = await session.execute_read(_run_evaluate)
+        data = await session.execute_read(_run)
 
     if data is None:
         raise HTTPException(404, f"Cart {cart_id} not found")
 
-    # Build violations
-    violations = [
-        Violation(
-            rule_id=v["rule_id"],
-            severity=v["severity"],
-            message=v["message"],
-            action=v.get("action"),
-            item=v.get("item"),
-        )
-        for v in data["violations"]
-        if v.get("rule_id") is not None
-    ]
-    error_count = sum(1 for v in violations if v.severity == "ERROR")
-    warning_count = sum(1 for v in violations if v.severity == "WARNING")
-    info_count = sum(1 for v in violations if v.severity == "INFO")
-
-    # Build BOM
-    panels: list[BOMPanelEntry] = []
-    for r in data["bom_records"]:
-        panels.append(
-            BOMPanelEntry(
-                panel_sku=r["panel_sku"],
-                install_method=r.get("install_method"),
-                required_consumables=[BOMConsumable(**c) for c in r.get("required", []) if c.get("sku")],
-                optional_consumables=[BOMConsumable(**c) for c in r.get("optional", []) if c.get("sku")],
-            )
-        )
-    trim_map: dict[str, list[BOMTrim]] = {}
-    for r in data["trim_records"]:
-        trim_map[r["panel_sku"]] = [
-            BOMTrim(
-                sku=t["sku"],
-                name=t.get("name"),
-                price=_safe_int(t.get("price")),
-                trim_type=t.get("type"),
-                suggestion=t.get("suggestion"),
-            )
-            for t in r.get("trims", [])
-            if t.get("sku")
-        ]
-    for panel_entry in panels:
-        panel_entry.suggested_trims = trim_map.get(panel_entry.panel_sku, [])
-
-    bom = BOMResult(cart_id=cart_id, panels=panels)
+    violations, error_count, warning_count, info_count = _build_violations(data["violations"])
+    bom = _build_bom(cart_id, data["bom_records"], data["trim_records"])
 
     return EvaluateResult(
         cart_id=data["meta"]["cart_id"],
