@@ -34,6 +34,7 @@ from app.models import (
 )
 from app.queries import (
     ADD_CART_ITEM,
+    ADD_CART_ITEMS_BATCH,
     ALL_CONSUMABLES,
     ALL_FURNITURE,
     ALL_LED_PROFILES,
@@ -97,21 +98,13 @@ async def require_api_key(
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _node_props(record, key: str = "p") -> dict:
-    node = record[key]
-    return dict(node)
-
-
 def _safe_int(val) -> int | None:
     if val is None:
         return None
-    return int(val)
-
-
-def _safe_list(val) -> list:
-    if val is None:
-        return []
-    return list(val)
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
 
 
 # ── Health ───────────────────────────────────────────────────────────────────
@@ -230,21 +223,22 @@ async def create_cart(body: CartCreateIn):
             wallHeightMm=body.wall_height_mm,
         )
 
-        # Add items (product MATCH guaranteed to succeed after validation)
-        for item in body.items:
-            item_id = f"{cart_id}_{item.sku}_{uuid.uuid4().hex[:8]}"
-            await session.run(
-                ADD_CART_ITEM,
-                cartId=cart_id,
-                itemId=item_id,
-                sku=item.sku,
-                itemType=item.item_type,
-                quantity=item.quantity,
-                unitPrice=None,
-                source=item.source,
-                widthFt=item.width_ft,
-                zone=item.zone,
-            )
+        # Add all items atomically via UNWIND
+        if body.items:
+            batch = [
+                {
+                    "id": f"{cart_id}_{item.sku}_{uuid.uuid4().hex[:8]}",
+                    "sku": item.sku,
+                    "item_type": item.item_type,
+                    "quantity": item.quantity,
+                    "unit_price": None,
+                    "source": item.source,
+                    "width_ft": item.width_ft,
+                    "zone": item.zone,
+                }
+                for item in body.items
+            ]
+            await session.run(ADD_CART_ITEMS_BATCH, cartId=cart_id, items=batch)
 
         # Return full cart
         result = await session.run(GET_CART, cartId=cart_id)

@@ -94,6 +94,26 @@ MERGE (ci)-[:REFERENCES]->(product)
 RETURN ci
 """
 
+ADD_CART_ITEMS_BATCH = """
+MATCH (c:Cart {id: $cartId})
+UNWIND $items AS item
+MATCH (product)
+  WHERE (product:Panel OR product:Trim OR product:Consumable
+    OR product:LEDProfile OR product:LEDStrip OR product:LEDKit OR product:Furniture)
+  AND product.sku = item.sku
+MERGE (ci:CartItem {id: item.id})
+SET ci.sku = item.sku,
+    ci.item_type = item.item_type,
+    ci.quantity = item.quantity,
+    ci.unit_price = COALESCE(item.unit_price, product.price),
+    ci.source = item.source,
+    ci.width_ft = item.width_ft,
+    ci.zone = item.zone
+MERGE (c)-[:CONTAINS_ITEM]->(ci)
+MERGE (ci)-[:REFERENCES]->(product)
+RETURN collect(ci) AS items
+"""
+
 REMOVE_CART_ITEM = """
 MATCH (c:Cart {id: $cartId})-[:CONTAINS_ITEM]->(ci:CartItem {id: $itemId})
 DETACH DELETE ci
@@ -103,7 +123,7 @@ RETURN count(*) AS removed
 GET_CART = """
 MATCH (c:Cart {id: $cartId})
 OPTIONAL MATCH (c)-[:CONTAINS_ITEM]->(ci:CartItem)
-RETURN c, collect(ci) AS items
+RETURN c, [x IN collect(ci) WHERE x IS NOT NULL] AS items
 """
 
 DELETE_CART = """
@@ -463,11 +483,13 @@ MATCH (panel:Panel {sku: ci.sku})
 OPTIONAL MATCH (panel)-[ru:HAS_U_TRIM]->(ut:Trim)
 OPTIONAL MATCH (panel)-[rl:HAS_L_TRIM]->(lt:Trim)
 OPTIONAL MATCH (panel)-[rh:HAS_H_TRIM]->(ht:Trim)
+OPTIONAL MATCH (panel)-[rm:HAS_METAL_TRIM]->(mt:Trim)
 WITH ci, panel,
   collect(DISTINCT CASE WHEN ut IS NOT NULL THEN {sku:ut.sku, name:ut.name, price:ut.price, type:'U', suggestion:ru.relationship_type} END) AS u,
   collect(DISTINCT CASE WHEN lt IS NOT NULL THEN {sku:lt.sku, name:lt.name, price:lt.price, type:'L', suggestion:rl.relationship_type} END) AS l,
-  collect(DISTINCT CASE WHEN ht IS NOT NULL THEN {sku:ht.sku, name:ht.name, price:ht.price, type:'H', suggestion:rh.relationship_type} END) AS h
-RETURN ci.sku AS panel_sku, [t IN u + l + h WHERE t IS NOT NULL] AS trims
+  collect(DISTINCT CASE WHEN ht IS NOT NULL THEN {sku:ht.sku, name:ht.name, price:ht.price, type:'H', suggestion:rh.relationship_type} END) AS h,
+  collect(DISTINCT CASE WHEN mt IS NOT NULL THEN {sku:mt.sku, name:mt.name, price:mt.price, type:'METAL', suggestion:rm.relationship_type} END) AS m
+RETURN ci.sku AS panel_sku, [t IN u + l + h + m WHERE t IS NOT NULL] AS trims
 ORDER BY ci.sku
 """
 
